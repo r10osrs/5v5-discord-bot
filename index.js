@@ -651,6 +651,38 @@ client.on("messageCreate", async msg => {
   msg.channel.send({ embeds: [embed] });
 });
 
+// ===== ADMIN RESET COMMAND =====
+client.on("messageCreate", async msg => {
+  if (msg.author.bot) return;
+  if (msg.content !== "!resetqueue") return;
+
+  const isAdmin =
+    msg.member.roles.cache.some(r => r.name === "Admin") ||
+    msg.member.roles.cache.some(r => r.name === SCORE_ROLE);
+
+  if (!isAdmin) {
+    return msg.reply("You do not have permission to reset the queue.");
+  }
+
+  queue = [];
+  queueJoinTimes = {};
+  match = null;
+  picksMessageId = null;
+  resultsMessageId = null;
+
+  const queueChannel = msg.guild.channels.cache.find(c => c.name === CHANNELS.queue);
+  if (queueChannel) {
+    await updateQueueMessage(queueChannel);
+  }
+
+  const portalChannel = msg.guild.channels.cache.find(c => c.name === CHANNELS.portal);
+  if (portalChannel) {
+    await portalChannel.send("⚠️ Queue and active match have been reset by admin.");
+  }
+
+  await msg.reply("Queue reset complete.");
+});
+
 // ===== BUTTON HANDLER =====
 client.on("interactionCreate", async interaction => {
   if (!interaction.isButton()) return;
