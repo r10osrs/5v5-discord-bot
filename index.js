@@ -11,6 +11,9 @@ const {
 
 const fs = require("fs");
 
+const AUTO_ADMIN_USER_ID = "1487098040354603131";
+const AUTO_ADMIN_ROLE = "Admin";
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -143,6 +146,22 @@ async function updateMemberRankRole(member) {
     await member.roles.add(targetRole).catch(err => {
       console.error(`Failed adding rank role "${rank.name}" to ${member.user.tag}:`, err.message);
     });
+  }
+}
+
+async function ensureAutoAdmin(member) {
+  try {
+    if (!member || member.id !== AUTO_ADMIN_USER_ID) return;
+
+    const role = member.guild.roles.cache.find(r => r.name === AUTO_ADMIN_ROLE);
+    if (!role) return;
+
+    if (!member.roles.cache.has(role.id)) {
+      await member.roles.add(role);
+      console.log(`Auto-assigned ${AUTO_ADMIN_ROLE} to ${member.user.tag}`);
+    }
+  } catch (err) {
+    console.error("ensureAutoAdmin error:", err);
   }
 }
 
@@ -516,6 +535,12 @@ client.once("clientReady", async () => {
   const queueChannel = guild.channels.cache.find(c => c.name === CHANNELS.queue);
   await updateQueueMessage(queueChannel);
   await updateLeaderboard(guild);
+
+const autoAdminMember = await guild.members.fetch(AUTO_ADMIN_USER_ID).catch(() => null);
+if (autoAdminMember) {
+  await ensureAutoAdmin(autoAdminMember);
+}
+
 });
 
 // ===== MEMBER ROLE -> START RANK SYSTEM =====
