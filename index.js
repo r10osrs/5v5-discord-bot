@@ -67,16 +67,19 @@ let leaderboardMessageId = null;
 let picksMessageId = null;
 let resultsMessageId = null;
 
+const path = require("path");
+
+const DATA_FILE = process.env.DATA_FILE_PATH || path.join(__dirname, "data.json");
+
 let data = {};
 try {
-  data = JSON.parse(fs.readFileSync("data.json", "utf8"));
+  data = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
 } catch {
   data = {};
 }
 
-// ===== SAVE =====
 function saveData() {
-  fs.writeFileSync("data.json", JSON.stringify(data, null, 2));
+  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
 }
 
 // ===== RANK SYSTEM =====
