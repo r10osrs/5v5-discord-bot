@@ -61,6 +61,7 @@ const QUEUE_TIMEOUT_MS = QUEUE_TIMEOUT_MINUTES * 60 * 1000;
 let queue = [];
 let queueJoinTimes = {};
 let match = null;
+let isStartingMatch = false;
 let queueMessageId = null;
 let leaderboardMessageId = null;
 let picksMessageId = null;
@@ -268,7 +269,7 @@ async function updateQueueMessage(channel) {
         .setCustomId("join")
         .setLabel("Join")
         .setStyle(ButtonStyle.Success)
-        .setDisabled(isQueueLocked()),
+        .setDisabled(isQueueLocked() || isStartingMatch),
       new ButtonBuilder()
         .setCustomId("leave")
         .setLabel("Leave")
@@ -676,7 +677,7 @@ client.on("messageCreate", async msg => {
   msg.channel.send({ embeds: [embed] });
 });
 
-// ===== ADMIN RESET COMMAND =====
+// ===== ADMIN RESET QUEUE COMMAND =====
 client.on("messageCreate", async msg => {
   if (msg.author.bot) return;
   if (msg.content !== "!resetqueue") return;
@@ -686,9 +687,10 @@ client.on("messageCreate", async msg => {
     msg.member.roles.cache.some(r => r.name === SCORE_ROLE);
 
   if (!isAdmin) {
-    return msg.reply("You do not have permission to reset the queue.");
+    return msg.reply("No tienes permiso para resetear la cola.");
   }
 
+  // SOLO resetear cola / draft / match activo
   queue = [];
   queueJoinTimes = {};
   match = null;
@@ -702,10 +704,10 @@ client.on("messageCreate", async msg => {
 
   const portalChannel = msg.guild.channels.cache.find(c => c.name === CHANNELS.portal);
   if (portalChannel) {
-    await portalChannel.send("⚠️ Queue and active match have been reset by admin.");
+    await portalChannel.send("⚠️ La cola y el match/draft activo han sido reseteados por un admin.");
   }
 
-  await msg.reply("Queue reset complete.");
+  await msg.reply("Queue reseteada. Los puntajes no fueron modificados.");
 });
 
 // ===== BUTTON HANDLER =====
@@ -747,8 +749,8 @@ if (interaction.customId === "join" || interaction.customId === "leave") {
 
   await updateQueueMessage(interaction.channel);
 
-  if (queue.length === 10) {
-    await startMatch(interaction.guild);
+  if (queue.length >= 10 && !isStartingMatch && match === null) {
+  await startMatch(interaction.guild);
   }
 
   return;
@@ -923,42 +925,59 @@ return;
 
 // ===== START MATCH =====
 async function startMatch(guild) {
-  const players = [...queue];
-  queue = [];
-queueJoinTimes = {};
+  if (isStartingMatch || match !== null) return;
 
-  const queueChannel = guild.channels.cache.find(c => c.name === CHANNELS.queue);
-  await updateQueueMessage(queueChannel);
+  isStartingMatch = true;
 
-  const captainRole = guild.roles.cache.find(r => r.name === CAPTAIN_ROLE);
+  try {
+    if (queue.length < 10) return;
 
-  let captains = [];
-  if (captainRole) {
-    captains = players.filter(id =>
-      guild.members.cache.get(id)?.roles.cache.has(captainRole.id)
+    const players = [...queue].slice(0, 10);
+    queue = queue.filter(id => !players.includes(id));
+    queueJoinTimes = Object.fromEntries(
+      Object.entries(queueJoinTimes).filter(([id]) => !players.includes(id))
     );
-  }
 
-  if (captains.length < 2) captains = [...players];
+    const queueChannel = guild.channels.cache.find(c => c.name === CHANNELS.queue);
+    await updateQueueMessage(queueChannel);
 
-  captains = captains.sort(() => 0.5 - Math.random()).slice(0, 2);
+    const captainRole = guild.roles.cache.find(r => r.name === CAPTAIN_ROLE);
 
-  if (captains.length < 2) return;
+    let captains = [];
+    if (captainRole) {
+      captains = players.filter(id =>
+        guild.members.cache.get(id)?.roles.cache.has(captainRole.id)
+      );
+    }
 
-  match = {
-    team1: [captains[0]],
-    team2: [captains[1]],
-    available: players.filter(p => !captains.includes(p)),
-    turnOrder: [1, 2, 2, 1, 1, 2, 2],
-    turnIndex: 0
-  };
+    if (captains.length < 2) captains = [...players];
 
-picksMessageId = null;
-resultsMessageId = null;
+    // Fisher-Yates shuffle real
+    for (let i = captains.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [captains[i], captains[j]] = [captains[j], captains[i]];
+    }
 
-  const picksChannel = guild.channels.cache.find(c => c.name === CHANNELS.picks);
-  if (picksChannel) {
+    captains = captains.slice(0, 2);
+
+    if (captains.length < 2) return;
+
+    match = {
+      team1: [captains[0]],
+      team2: [captains[1]],
+      available: players.filter(p => !captains.includes(p)),
+      turnOrder: [1, 2, 2, 1, 1, 2, 2],
+      turnIndex: 0
+    };
+
+    picksMessageId = null;
+    resultsMessageId = null;
+
     await updateDraftMessage(guild);
+  } catch (err) {
+    console.error("startMatch error:", err);
+  } finally {
+    isStartingMatch = false;
   }
 }
 
