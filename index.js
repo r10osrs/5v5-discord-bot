@@ -776,55 +776,82 @@ if (interaction.customId === "join" || interaction.customId === "leave") {
 
     // ===== DRAFT PICK BUTTONS =====
     if (interaction.customId.startsWith("draft_pick_")) {
-      if (!match) {
-        return interaction.reply({ content: "No active draft.", ephemeral: true });
-      }
+  if (!match) {
+    return interaction.reply({ content: "No active draft.", ephemeral: true });
+  }
 
-      const playerId = interaction.customId.replace("draft_pick_", "");
-      const teamTurn = match.turnOrder[match.turnIndex];
-      const currentCaptain = teamTurn === 1 ? match.team1[0] : match.team2[0];
+  const playerId = interaction.customId.replace("draft_pick_", "");
+  const teamTurn = match.turnOrder[match.turnIndex];
+  const currentCaptain = teamTurn === 1 ? match.team1[0] : match.team2[0];
 
-      if (interaction.user.id !== currentCaptain) {
-        return interaction.reply({ content: "It is not your turn to pick.", ephemeral: true });
-      }
+  if (interaction.user.id !== currentCaptain) {
+    return interaction.reply({ content: "It is not your turn to pick.", ephemeral: true });
+  }
 
-      if (!match.available.includes(playerId)) {
-        return interaction.reply({ content: "That player is no longer available.", ephemeral: true });
-      }
+  if (!match.available.includes(playerId)) {
+    return interaction.reply({ content: "That player is no longer available.", ephemeral: true });
+  }
 
-      await interaction.deferUpdate();
+  await interaction.deferUpdate();
 
-      if (teamTurn === 1) {
-        match.team1.push(playerId);
-      } else {
-        match.team2.push(playerId);
-      }
+  if (teamTurn === 1) {
+    match.team1.push(playerId);
+  } else {
+    match.team2.push(playerId);
+  }
 
-      match.available = match.available.filter(id => id !== playerId);
-      match.turnIndex++;
+  match.available = match.available.filter(id => id !== playerId);
+  match.turnIndex++;
 
-      if (match.available.length === 1) {
-        const lastPlayer = match.available[0];
+  const picksChannel = interaction.guild.channels.cache.find(c => c.name === CHANNELS.picks);
 
-        if (match.team1.length < 5) {
-          match.team1.push(lastPlayer);
-        } else {
-          match.team2.push(lastPlayer);
-        }
+  // Si queda 1 jugador, autoasignarlo y mostrar ambos últimos movimientos
+  if (match.available.length === 1) {
+    const lastPlayer = match.available[0];
 
-        match.available = [];
-        await finishMatch(interaction.guild);
-        return;
-      }
-
-      if (match.available.length === 0 || match.turnIndex >= match.turnOrder.length) {
-        await finishMatch(interaction.guild);
-        return;
-      }
-
-      await updateDraftMessage(interaction.guild);
-      return;
+    let autoAssignedTeam = "";
+    if (match.team1.length < 5) {
+      match.team1.push(lastPlayer);
+      autoAssignedTeam = "Team 1";
+    } else {
+      match.team2.push(lastPlayer);
+      autoAssignedTeam = "Team 2";
     }
+
+    match.available = [];
+
+    await updateDraftMessage(interaction.guild);
+
+    if (picksChannel) {
+      await picksChannel.send(
+        `✅ Picked: <@${playerId}>\n` +
+        `📌 Auto-assigned final player: <@${lastPlayer}> → ${autoAssignedTeam}`
+      );
+    }
+
+    await finishMatch(interaction.guild);
+    return;
+  }
+
+  if (match.available.length === 0 || match.turnIndex >= match.turnOrder.length) {
+    await updateDraftMessage(interaction.guild);
+
+    if (picksChannel) {
+      await picksChannel.send(`✅ Picked: <@${playerId}>`);
+    }
+
+    await finishMatch(interaction.guild);
+    return;
+  }
+
+  await updateDraftMessage(interaction.guild);
+
+  if (picksChannel) {
+    await picksChannel.send(`✅ Picked: <@${playerId}>`);
+  }
+
+  return;
+}
 
     // ===== SCORE BUTTONS =====
 if (interaction.customId === "score_team1" || interaction.customId === "score_team2") {
