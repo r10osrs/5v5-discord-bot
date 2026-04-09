@@ -62,6 +62,7 @@ let queue = [];
 let queueJoinTimes = {};
 let match = null;
 let isStartingMatch = false;
+let isScoringMatch = false;
 let queueMessageId = null;
 let leaderboardMessageId = null;
 let picksMessageId = null;
@@ -79,6 +80,12 @@ try {
 }
 
 function saveData() {
+  const dir = path.dirname(DATA_FILE);
+
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+
   fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
 }
 
@@ -492,14 +499,21 @@ function updatePointsDetailed(id, win) {
   return { before, after };
 }
 
-function getNextMatchId() {
+function peekNextMatchId() {
+  if (!data._meta) {
+    data._meta = { nextMatchId: 1 };
+  }
+
+  return data._meta.nextMatchId;
+}
+
+function commitNextMatchId() {
   if (!data._meta) {
     data._meta = { nextMatchId: 1 };
   }
 
   const id = data._meta.nextMatchId;
   data._meta.nextMatchId += 1;
-
   saveData();
 
   return id;
@@ -724,11 +738,12 @@ client.on("interactionCreate", async interaction => {
 if (interaction.customId === "join" || interaction.customId === "leave") {
   await interaction.deferUpdate();
 
+  // Si está arrancando match o ya hay match activo, no dejar entrar
   if (interaction.customId === "join") {
-    if (isQueueLocked()) {
+    if (isQueueLocked() || isStartingMatch) {
       try {
         await interaction.followUp({
-          content: "A match is already running. You cannot join a new queue until it is scored.",
+          content: "La cola está bloqueada porque hay un match en curso o arrancando.",
           ephemeral: true
         });
       } catch {}
@@ -753,7 +768,7 @@ if (interaction.customId === "join" || interaction.customId === "leave") {
   await updateQueueMessage(interaction.channel);
 
   if (queue.length >= 10 && !isStartingMatch && match === null) {
-  await startMatch(interaction.guild);
+    await startMatch(interaction.guild);
   }
 
   return;
@@ -817,62 +832,59 @@ if (interaction.customId === "score_team1" || interaction.customId === "score_te
     return interaction.reply({ content: "No active match to score.", ephemeral: true });
   }
 
+  if (isScoringMatch || match.scored) {
+    return interaction.reply({ content: "Este match ya fue scoreado o se está procesando.", ephemeral: true });
+  }
+
   const member = interaction.member;
   if (!member.roles.cache.some(r => r.name === SCORE_ROLE)) {
     return interaction.reply({ content: "You do not have permission to score games.", ephemeral: true });
   }
 
-  await interaction.deferUpdate();
+  isScoringMatch = true;
+  match.scored = true;
 
-  const winner = interaction.customId === "score_team1" ? "team1" : "team2";
+  try {
+    await interaction.deferUpdate();
 
-  const win = winner === "team1" ? match.team1 : match.team2;
-  const lose = winner === "team1" ? match.team2 : match.team1;
+    const winner = interaction.customId === "score_team1" ? "team1" : "team2";
 
-  const winData = {};
-  const loseData = {};
+    const win = winner === "team1" ? match.team1 : match.team2;
+    const lose = winner === "team1" ? match.team2 : match.team1;
 
-  win.forEach(id => {
-  ensurePlayerData(id);
+    const winData = {};
+    const loseData = {};
 
-  winData[id] = updatePointsDetailed(id, true);
-
-  data[id].wins += 1;
-  data[id].games += 1;
-});
-
-lose.forEach(id => {
-  ensurePlayerData(id);
-
-  loseData[id] = updatePointsDetailed(id, false);
-
-  data[id].losses += 1;
-  data[id].games += 1;
-});
-
-  lose.forEach(id => {
-    loseData[id] = updatePointsDetailed(id, false);
-  });
-
-  saveData();
-
-  for (const playerId of [...win, ...lose]) {
-    const guildMember = await interaction.guild.members.fetch(playerId).catch(() => null);
-    if (guildMember) {
-      await updateMemberRankRole(guildMember);
-      await updateMemberPointsNickname(guildMember);
+    for (const id of win) {
+      ensurePlayerData(id);
+      winData[id] = updatePointsDetailed(id, true);
+      data[id].wins += 1;
+      data[id].games += 1;
     }
-  }
 
-  const matchId = getNextMatchId();
+    for (const id of lose) {
+      ensurePlayerData(id);
+      loseData[id] = updatePointsDetailed(id, false);
+      data[id].losses += 1;
+      data[id].games += 1;
+    }
 
-saveMatchHistory(matchId, match.team1, match.team2, winner);
+    saveData();
 
-  const formatPlayers = (players, dataObj) =>
+    for (const playerId of [...win, ...lose]) {
+      const guildMember = await interaction.guild.members.fetch(playerId).catch(() => null);
+      if (guildMember) {
+        await updateMemberRankRole(guildMember);
+        await updateMemberPointsNickname(guildMember);
+      }
+    }
+
+    const matchId = peekNextMatchId();
+
+const formatPlayers = (players, dataObj) =>
   players.map(id => {
     const p = dataObj[id];
     const stats = data[id];
-
     const winrate = stats.games > 0
       ? ((stats.wins / stats.games) * 100).toFixed(0)
       : 0;
@@ -880,39 +892,49 @@ saveMatchHistory(matchId, match.team1, match.team2, winner);
     return `<@${id}> ${p.before} → ${p.after} | ${stats.wins}W-${stats.losses}L (${winrate}%)`;
   }).join("\n");
 
-  const embed = new EmbedBuilder()
-    .setTitle(`Game #${matchId}`)
-    .addFields(
-      {
-        name: "🏆 Winners",
-        value: formatPlayers(win, winData),
-        inline: true
-      },
-      {
-        name: "❌ Losers",
-        value: formatPlayers(lose, loseData),
-        inline: true
-      }
-    )
-    .setFooter({ text: `Winner: ${winner}` })
-    .setTimestamp();
+const embed = new EmbedBuilder()
+  .setTitle(`Game #${matchId}`)
+  .addFields(
+    {
+      name: "🏆 Winners",
+      value: formatPlayers(win, winData),
+      inline: true
+    },
+    {
+      name: "❌ Losers",
+      value: formatPlayers(lose, loseData),
+      inline: true
+    }
+  )
+  .setFooter({ text: `Winner: ${winner}` })
+  .setTimestamp();
 
-  const resultsChannel = interaction.guild.channels.cache.find(c => c.name === CHANNELS.results);
-  if (resultsChannel) {
-    await resultsChannel.send({ embeds: [embed] });
-  }
+const resultsChannel = interaction.guild.channels.cache.find(c => c.name === CHANNELS.results);
+if (resultsChannel) {
+  await resultsChannel.send({ embeds: [embed] });
 
-  await updateLeaderboard(interaction.guild);
-  await disableResultButtons(interaction.guild);
-
-  match = null;
-
-const queueChannel = interaction.guild.channels.cache.find(c => c.name === CHANNELS.queue);
-if (queueChannel) {
-  await updateQueueMessage(queueChannel);
+  commitNextMatchId();
+  saveMatchHistory(matchId, match.team1, match.team2, winner);
 }
 
-return;
+    await disableResultButtons(interaction.guild);
+    await updateLeaderboard(interaction.guild);
+
+    match = null;
+
+    const queueChannel = interaction.guild.channels.cache.find(c => c.name === CHANNELS.queue);
+    if (queueChannel) {
+      await updateQueueMessage(queueChannel);
+    }
+
+    } catch (err) {
+    console.error("Score processing error:", err);
+    match.scored = false;
+  } finally {
+    isScoringMatch = false;
+  }
+
+  return;
 }
 
   } catch (err) {
@@ -936,10 +958,14 @@ async function startMatch(guild) {
     if (queue.length < 10) return;
 
     const players = [...queue].slice(0, 10);
+
+    // Quitar SOLO los 10 primeros del queue
     queue = queue.filter(id => !players.includes(id));
-    queueJoinTimes = Object.fromEntries(
-      Object.entries(queueJoinTimes).filter(([id]) => !players.includes(id))
-    );
+
+    // Limpiar sus timers
+    for (const id of players) {
+      delete queueJoinTimes[id];
+    }
 
     const queueChannel = guild.channels.cache.find(c => c.name === CHANNELS.queue);
     await updateQueueMessage(queueChannel);
@@ -955,7 +981,7 @@ async function startMatch(guild) {
 
     if (captains.length < 2) captains = [...players];
 
-    // Fisher-Yates shuffle real
+    // Fisher-Yates
     for (let i = captains.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
       [captains[i], captains[j]] = [captains[j], captains[i]];
@@ -970,7 +996,8 @@ async function startMatch(guild) {
       team2: [captains[1]],
       available: players.filter(p => !captains.includes(p)),
       turnOrder: [1, 2, 2, 1, 1, 2, 2],
-      turnIndex: 0
+      turnIndex: 0,
+      scored: false
     };
 
     picksMessageId = null;
