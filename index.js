@@ -10,6 +10,7 @@ const {
 } = require("discord.js");
 
 const fs = require("fs");
+const path = require("path");
 
 const AUTO_ADMIN_USER_ID = "1487098040354603131";
 const AUTO_ADMIN_ROLE = "Admin";
@@ -25,11 +26,31 @@ const client = new Client({
 
 // ===== CONFIG =====
 const CHANNELS = {
-  queue: "5s",
   portal: "portal",
   picks: "picks",
   results: "results",
   leaderboard: "leaderboard"
+};
+
+const MODES = {
+  "3s": {
+    label: "3v3",
+    queueChannel: "3s",
+    size: 6,
+    turnOrder: [1, 2, 2, 1]
+  },
+  "5s": {
+    label: "5v5",
+    queueChannel: "5s",
+    size: 10,
+    turnOrder: [1, 2, 2, 1, 1, 2, 2]
+  },
+  "7s": {
+    label: "7v7",
+    queueChannel: "7s",
+    size: 14,
+    turnOrder: [1, 2, 2, 1, 1, 2, 2, 1, 1, 2, 2, 1]
+  }
 };
 
 const CAPTAIN_ROLE = "Captain";
@@ -57,19 +78,7 @@ const RANK_ROLE_NAMES = [
 const QUEUE_TIMEOUT_MINUTES = 60;
 const QUEUE_TIMEOUT_MS = QUEUE_TIMEOUT_MINUTES * 60 * 1000;
 
-// ===== DATA =====
-let queue = [];
-let queueJoinTimes = {};
-let match = null;
-let isStartingMatch = false;
-let isScoringMatch = false;
-let queueMessageId = null;
-let leaderboardMessageId = null;
-let picksMessageId = null;
-let resultsMessageId = null;
-
-const path = require("path");
-
+// ===== DATA FILE =====
 const DATA_FILE = process.env.DATA_FILE_PATH || path.join(__dirname, "data.json");
 
 let data = {};
@@ -87,6 +96,63 @@ function saveData() {
   }
 
   fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+}
+
+// ===== GLOBAL STATE =====
+const queueState = {
+  "3s": { queue: [], queueJoinTimes: {}, messageId: null },
+  "5s": { queue: [], queueJoinTimes: {}, messageId: null },
+  "7s": { queue: [], queueJoinTimes: {}, messageId: null }
+};
+
+let activeMatch = null;
+let isStartingMatch = false;
+let isScoringMatch = false;
+let leaderboardMessageId = null;
+let picksMessageId = null;
+let resultsMessageId = null;
+
+// ===== HELPERS =====
+function isAnyMatchRunning() {
+  return activeMatch !== null;
+}
+
+function getPlayerQueuedMode(userId) {
+  for (const modeKey of Object.keys(queueState)) {
+    if (queueState[modeKey].queue.includes(userId)) {
+      return modeKey;
+    }
+  }
+  return null;
+}
+
+function getQueueChannel(guild, modeKey) {
+  return guild.channels.cache.find(c => c.name === MODES[modeKey].queueChannel);
+}
+
+function getPicksChannel(guild) {
+  return guild.channels.cache.find(c => c.name === CHANNELS.picks);
+}
+
+function getResultsChannel(guild) {
+  return guild.channels.cache.find(c => c.name === CHANNELS.results);
+}
+
+function getPortalChannel(guild) {
+  return guild.channels.cache.find(c => c.name === CHANNELS.portal);
+}
+
+function getLeaderboardChannel(guild) {
+  return guild.channels.cache.find(c => c.name === CHANNELS.leaderboard);
+}
+
+async function updateAllQueueMessages(guild) {
+  for (const modeKey of Object.keys(MODES)) {
+    const channel = getQueueChannel(guild, modeKey);
+    if (channel) {
+      await updateQueueMessage(modeKey, channel);
+    }
+  }
 }
 
 // ===== RANK SYSTEM =====
@@ -108,6 +174,8 @@ function getRank(points) {
 }
 
 function ensurePlayerData(userId) {
+  let changed = false;
+
   if (!data[userId]) {
     data[userId] = {
       points: 180,
@@ -115,12 +183,23 @@ function ensurePlayerData(userId) {
       losses: 0,
       games: 0
     };
+    changed = true;
   } else {
-    // Backwards compatibility (VERY IMPORTANT)
-    if (data[userId].wins === undefined) data[userId].wins = 0;
-    if (data[userId].losses === undefined) data[userId].losses = 0;
-    if (data[userId].games === undefined) data[userId].games = 0;
+    if (data[userId].wins === undefined) {
+      data[userId].wins = 0;
+      changed = true;
+    }
+    if (data[userId].losses === undefined) {
+      data[userId].losses = 0;
+      changed = true;
+    }
+    if (data[userId].games === undefined) {
+      data[userId].games = 0;
+      changed = true;
+    }
   }
+
+  if (changed) saveData();
 }
 
 async function updateMemberRankRole(member) {
@@ -183,13 +262,8 @@ async function updateMemberPointsNickname(member) {
     ensurePlayerData(member.id);
 
     const points = data[member.id].points;
-
-    // Use current nickname if they have one, otherwise username
-    const currentBaseName = member.nickname || member.user.username;
-
-    // Remove old [123] prefix if it already exists
+    const currentBaseName = member.displayName;
     const cleanedBaseName = currentBaseName.replace(/^\[\d+\]\s*/, "");
-
     const newNick = `[${points}] ${cleanedBaseName}`.slice(0, 32);
 
     await member.setNickname(newNick).catch(err => {
@@ -210,58 +284,63 @@ async function initializeMember(member) {
   }
 }
 
-function isQueueLocked() {
-  return match !== null;
-}
-
-async function removeExpiredQueuePlayers(guild) {
+// ===== QUEUE TIMEOUT =====
+async function removeExpiredQueuePlayers(guild, modeKey) {
   try {
+    const state = queueState[modeKey];
     const now = Date.now();
-    const expiredPlayers = queue.filter(userId => {
-      const joinedAt = queueJoinTimes[userId];
+
+    const expiredPlayers = state.queue.filter(userId => {
+      const joinedAt = state.queueJoinTimes[userId];
       return joinedAt && now - joinedAt >= QUEUE_TIMEOUT_MS;
     });
 
     if (expiredPlayers.length === 0) return;
 
-    queue = queue.filter(userId => !expiredPlayers.includes(userId));
+    state.queue = state.queue.filter(userId => !expiredPlayers.includes(userId));
 
     for (const userId of expiredPlayers) {
-      delete queueJoinTimes[userId];
+      delete state.queueJoinTimes[userId];
     }
 
-    const portalChannel = guild.channels.cache.find(c => c.name === CHANNELS.portal);
+    const portalChannel = getPortalChannel(guild);
     if (portalChannel) {
       for (const userId of expiredPlayers) {
         const embed = new EmbedBuilder()
-          .setTitle("Queue 5s")
-          .setDescription(`⏰ <@${userId}> timed out and was removed from the queue\n\n**Queue:** ${queue.length}/10`)
+          .setTitle(`${MODES[modeKey].label} Queue`)
+          .setDescription(
+            `⏰ <@${userId}> timed out and was removed from the queue\n\n` +
+            `**Queue:** ${state.queue.length}/${MODES[modeKey].size}`
+          )
           .setTimestamp();
 
         await portalChannel.send({ embeds: [embed] });
       }
     }
 
-    const queueChannel = guild.channels.cache.find(c => c.name === CHANNELS.queue);
+    const queueChannel = getQueueChannel(guild, modeKey);
     if (queueChannel) {
-      await updateQueueMessage(queueChannel);
+      await updateQueueMessage(modeKey, queueChannel);
     }
   } catch (err) {
-    console.error("removeExpiredQueuePlayers error:", err);
+    console.error(`removeExpiredQueuePlayers error (${modeKey}):`, err);
   }
 }
 
 // ===== QUEUE MESSAGE =====
-async function updateQueueMessage(channel) {
+async function updateQueueMessage(modeKey, channel) {
   try {
     if (!channel) return;
 
+    const state = queueState[modeKey];
     const now = Date.now();
 
-    const queueLines = queue.length
-      ? queue.map(id => {
-          const joinedAt = queueJoinTimes[id];
-          const timeLeftMs = joinedAt ? Math.max(0, QUEUE_TIMEOUT_MS - (now - joinedAt)) : QUEUE_TIMEOUT_MS;
+    const queueLines = state.queue.length
+      ? state.queue.map(id => {
+          const joinedAt = state.queueJoinTimes[id];
+          const timeLeftMs = joinedAt
+            ? Math.max(0, QUEUE_TIMEOUT_MS - (now - joinedAt))
+            : QUEUE_TIMEOUT_MS;
           const minutes = Math.floor(timeLeftMs / 60000);
           const seconds = Math.floor((timeLeftMs % 60000) / 1000);
           const timeText = `${minutes}:${seconds.toString().padStart(2, "0")}`;
@@ -270,53 +349,59 @@ async function updateQueueMessage(channel) {
       : "No players in queue";
 
     const embed = new EmbedBuilder()
-      .setTitle("5v5 Queue")
+      .setTitle(`${MODES[modeKey].label} Queue`)
       .setDescription(queueLines)
-      .setFooter({ text: isQueueLocked() ? "Queue locked: match in progress" : `${queue.length}/10 players` });
+      .setFooter({
+        text: isAnyMatchRunning()
+          ? "Queues locked: match in progress"
+          : `${state.queue.length}/${MODES[modeKey].size} players`
+      });
 
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder()
-        .setCustomId("join")
+        .setCustomId(`join_${modeKey}`)
         .setLabel("Join")
         .setStyle(ButtonStyle.Success)
-        .setDisabled(isQueueLocked() || isStartingMatch),
+        .setDisabled(isAnyMatchRunning() || isStartingMatch),
       new ButtonBuilder()
-        .setCustomId("leave")
+        .setCustomId(`leave_${modeKey}`)
         .setLabel("Leave")
         .setStyle(ButtonStyle.Danger)
     );
 
-    if (queueMessageId) {
+    if (state.messageId) {
       try {
-        const existingMessage = await channel.messages.fetch(queueMessageId);
+        const existingMessage = await channel.messages.fetch(state.messageId);
         await existingMessage.edit({ embeds: [embed], components: [row] });
         return;
       } catch {
-        queueMessageId = null;
+        state.messageId = null;
       }
     }
 
     const newMessage = await channel.send({ embeds: [embed], components: [row] });
-    queueMessageId = newMessage.id;
+    state.messageId = newMessage.id;
   } catch (err) {
-    console.error("updateQueueMessage error:", err);
+    console.error(`updateQueueMessage error (${modeKey}):`, err);
   }
 }
 
 // ===== PORTAL =====
-async function sendPortalUpdate(guild, action, userId) {
+async function sendPortalUpdate(guild, modeKey, action, userId) {
   try {
-    const portalChannel = guild.channels.cache.find(c => c.name === CHANNELS.portal);
+    const portalChannel = getPortalChannel(guild);
     if (!portalChannel) return;
+
+    const state = queueState[modeKey];
 
     const actionText =
       action === "join"
-        ? `🟢 <@${userId}> joined the queue`
-        : `🔴 <@${userId}> left the queue`;
+        ? `🟢 <@${userId}> joined the ${MODES[modeKey].label} queue`
+        : `🔴 <@${userId}> left the ${MODES[modeKey].label} queue`;
 
     const embed = new EmbedBuilder()
-      .setTitle("Queue 5s")
-      .setDescription(`${actionText}\n\n**Queue:** ${queue.length}/10`)
+      .setTitle(`${MODES[modeKey].label} Queue`)
+      .setDescription(`${actionText}\n\n**Queue:** ${state.queue.length}/${MODES[modeKey].size}`)
       .setTimestamp();
 
     await portalChannel.send({ embeds: [embed] });
@@ -325,42 +410,47 @@ async function sendPortalUpdate(guild, action, userId) {
   }
 }
 
-function buildDraftEmbed(guild) {
-  const team1Captain = match.team1[0];
-  const team2Captain = match.team2[0];
+// ===== DRAFT =====
+function buildDraftEmbed() {
+  if (!activeMatch) return null;
 
-  const turnTeam = match.turnOrder[match.turnIndex];
+  const team1Captain = activeMatch.team1[0];
+  const team2Captain = activeMatch.team2[0];
+
+  const turnTeam = activeMatch.turnOrder[activeMatch.turnIndex];
   const currentCaptain = turnTeam === 1 ? team1Captain : team2Captain;
 
-  const availableText = match.available.length
-    ? match.available.map(id => `<@${id}>`).join("\n")
+  const availableText = activeMatch.available.length
+    ? activeMatch.available.map(id => `<@${id}>`).join("\n")
     : "No players remaining";
 
   return new EmbedBuilder()
-    .setTitle("5v5 Draft")
+    .setTitle(`${MODES[activeMatch.modeKey].label} Draft`)
     .setDescription(
       `**Captain Team 1:** <@${team1Captain}>\n` +
       `**Captain Team 2:** <@${team2Captain}>\n\n` +
       `**Current turn:** <@${currentCaptain}>\n\n` +
-      `**Team 1:**\n${match.team1.map(id => `<@${id}>`).join("\n")}\n\n` +
-      `**Team 2:**\n${match.team2.map(id => `<@${id}>`).join("\n")}\n\n` +
+      `**Team 1:**\n${activeMatch.team1.map(id => `<@${id}>`).join("\n")}\n\n` +
+      `**Team 2:**\n${activeMatch.team2.map(id => `<@${id}>`).join("\n")}\n\n` +
       `**Available Players:**\n${availableText}`
     );
 }
 
 function buildDraftButtons(guild) {
+  if (!activeMatch) return [];
+
   const rows = [];
   const chunkSize = 5;
 
-  for (let i = 0; i < match.available.length; i += chunkSize) {
+  for (let i = 0; i < activeMatch.available.length; i += chunkSize) {
     const row = new ActionRowBuilder();
-    const slice = match.available.slice(i, i + chunkSize);
+    const slice = activeMatch.available.slice(i, i + chunkSize);
 
     for (const playerId of slice) {
       const member = guild.members.cache.get(playerId);
       const name = member?.displayName || member?.user?.username || "Player";
-      const points = data[playerId] ? data[playerId].points : 180;
-
+      ensurePlayerData(playerId);
+      const points = data[playerId].points;
       const label = `${points} ${name}`.slice(0, 20);
 
       row.addComponents(
@@ -378,10 +468,10 @@ function buildDraftButtons(guild) {
 }
 
 async function updateDraftMessage(guild) {
-  const picksChannel = guild.channels.cache.find(c => c.name === CHANNELS.picks);
-  if (!picksChannel || !match) return;
+  const picksChannel = getPicksChannel(guild);
+  if (!picksChannel || !activeMatch) return;
 
-  const embed = buildDraftEmbed(guild);
+  const embed = buildDraftEmbed();
   const components = buildDraftButtons(guild);
 
   if (picksMessageId) {
@@ -400,10 +490,10 @@ async function updateDraftMessage(guild) {
 
 function buildResultsEmbed() {
   return new EmbedBuilder()
-    .setTitle("Match Ready")
+    .setTitle(`${MODES[activeMatch.modeKey].label} Match Ready`)
     .setDescription(
-      `**Team 1:**\n${match.team1.map(id => `<@${id}>`).join("\n")}\n\n` +
-      `**Team 2:**\n${match.team2.map(id => `<@${id}>`).join("\n")}`
+      `**Team 1:**\n${activeMatch.team1.map(id => `<@${id}>`).join("\n")}\n\n` +
+      `**Team 2:**\n${activeMatch.team2.map(id => `<@${id}>`).join("\n")}`
     );
 }
 
@@ -423,7 +513,7 @@ function buildResultButtons() {
 }
 
 async function disableResultButtons(guild) {
-  const resultsChannel = guild.channels.cache.find(c => c.name === CHANNELS.results);
+  const resultsChannel = getResultsChannel(guild);
   if (!resultsChannel || !resultsMessageId) return;
 
   try {
@@ -451,13 +541,13 @@ async function disableResultButtons(guild) {
 // ===== LEADERBOARD =====
 async function updateLeaderboard(guild) {
   try {
-    const channel = guild.channels.cache.find(c => c.name === CHANNELS.leaderboard);
+    const channel = getLeaderboardChannel(guild);
     if (!channel) return;
 
     const sorted = Object.entries(data)
-  .filter(([id, value]) => id !== "_meta" && value && typeof value.points === "number")
-  .sort((a, b) => b[1].points - a[1].points)
-  .slice(0, 10);
+      .filter(([id, value]) => id !== "_meta" && id !== "_matches" && value && typeof value.points === "number")
+      .sort((a, b) => b[1].points - a[1].points)
+      .slice(0, 10);
 
     let text = "**🏆 Leaderboard**\n\n";
 
@@ -519,13 +609,14 @@ function commitNextMatchId() {
   return id;
 }
 
-function saveMatchHistory(matchId, team1, team2, winner) {
+function saveMatchHistory(matchId, modeKey, team1, team2, winner) {
   if (!data._matches) {
     data._matches = [];
   }
 
   data._matches.push({
     id: matchId,
+    mode: modeKey,
     team1,
     team2,
     winner,
@@ -543,6 +634,92 @@ async function refreshPlayerAfterPointChange(guild, userId) {
   await updateMemberPointsNickname(member);
 }
 
+// ===== MATCH =====
+async function startMatch(guild, modeKey) {
+  if (isStartingMatch || activeMatch !== null) return;
+
+  isStartingMatch = true;
+
+  try {
+    const state = queueState[modeKey];
+    const config = MODES[modeKey];
+
+    if (state.queue.length < config.size) return;
+
+    const players = state.queue.slice(0, config.size);
+    state.queue = state.queue.slice(config.size);
+
+    for (const id of players) {
+      delete state.queueJoinTimes[id];
+    }
+
+    await updateAllQueueMessages(guild);
+
+    const captainRole = guild.roles.cache.find(r => r.name === CAPTAIN_ROLE);
+
+    let captains = [];
+    if (captainRole) {
+      captains = players.filter(id =>
+        guild.members.cache.get(id)?.roles.cache.has(captainRole.id)
+      );
+    }
+
+    if (captains.length < 2) captains = [...players];
+
+    for (let i = captains.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [captains[i], captains[j]] = [captains[j], captains[i]];
+    }
+
+    captains = captains.slice(0, 2);
+
+    if (captains.length < 2) return;
+
+    activeMatch = {
+      modeKey,
+      team1: [captains[0]],
+      team2: [captains[1]],
+      available: players.filter(p => !captains.includes(p)),
+      turnOrder: config.turnOrder,
+      turnIndex: 0,
+      scored: false
+    };
+
+    picksMessageId = null;
+    resultsMessageId = null;
+
+    await updateDraftMessage(guild);
+    await updateAllQueueMessages(guild);
+  } catch (err) {
+    console.error("startMatch error:", err);
+  } finally {
+    isStartingMatch = false;
+  }
+}
+
+async function finishMatch(guild) {
+  const results = getResultsChannel(guild);
+  if (!results || !activeMatch) return;
+
+  const embed = buildResultsEmbed();
+  const components = buildResultButtons();
+
+  const msg = await results.send({
+    embeds: [embed],
+    components
+  });
+
+  resultsMessageId = msg.id;
+
+  const picksChannel = getPicksChannel(guild);
+  if (picksChannel && picksMessageId) {
+    try {
+      const picksMsg = await picksChannel.messages.fetch(picksMessageId);
+      await picksMsg.edit({ components: [] });
+    } catch {}
+  }
+}
+
 // ===== READY =====
 client.once("clientReady", async () => {
   console.log("Bot ready");
@@ -550,18 +727,26 @@ client.once("clientReady", async () => {
   const guild = client.guilds.cache.first();
   if (!guild) return;
 
-  const queueChannel = guild.channels.cache.find(c => c.name === CHANNELS.queue);
-  await updateQueueMessage(queueChannel);
+  for (const modeKey of Object.keys(MODES)) {
+    const queueChannel = getQueueChannel(guild, modeKey);
+    if (queueChannel) {
+      await updateQueueMessage(modeKey, queueChannel);
+    }
+  }
+
   await updateLeaderboard(guild);
 
-const autoAdminMember = await guild.members.fetch(AUTO_ADMIN_USER_ID).catch(() => null);
-if (autoAdminMember) {
-  await ensureAutoAdmin(autoAdminMember);
-}
-
+  const autoAdminMember = await guild.members.fetch(AUTO_ADMIN_USER_ID).catch(() => null);
+  if (autoAdminMember) {
+    await ensureAutoAdmin(autoAdminMember);
+  }
 });
 
 // ===== MEMBER ROLE -> START RANK SYSTEM =====
+client.on("guildMemberAdd", async member => {
+  await ensureAutoAdmin(member);
+});
+
 client.on("guildMemberUpdate", async (oldMember, newMember) => {
   try {
     const memberRole = newMember.guild.roles.cache.find(role => role.name === MEMBER_ROLE);
@@ -642,7 +827,6 @@ client.on("messageCreate", async msg => {
 // ===== PLAYER STATS COMMAND =====
 client.on("messageCreate", async msg => {
   if (msg.author.bot) return;
-
   if (!msg.content.startsWith("!stats")) return;
 
   const target = msg.mentions.users.first() || msg.author;
@@ -650,7 +834,6 @@ client.on("messageCreate", async msg => {
   ensurePlayerData(target.id);
 
   const player = data[target.id];
-
   const winrate = player.games > 0
     ? ((player.wins / player.games) * 100).toFixed(1)
     : 0;
@@ -667,13 +850,12 @@ client.on("messageCreate", async msg => {
     )
     .setTimestamp();
 
-  msg.channel.send({ embeds: [embed] });
+  await msg.channel.send({ embeds: [embed] });
 });
 
 // ===== MATCH HISTORY COMMAND =====
 client.on("messageCreate", async msg => {
   if (msg.author.bot) return;
-
   if (!msg.content.startsWith("!history")) return;
 
   if (!data._matches || data._matches.length === 0) {
@@ -683,7 +865,7 @@ client.on("messageCreate", async msg => {
   const lastMatches = data._matches.slice(-5).reverse();
 
   const text = lastMatches.map(m => {
-    return `Game #${m.id} — Winner: ${m.winner}`;
+    return `Game #${m.id} — ${MODES[m.mode]?.label || m.mode} — Winner: ${m.winner}`;
   }).join("\n");
 
   const embed = new EmbedBuilder()
@@ -691,7 +873,7 @@ client.on("messageCreate", async msg => {
     .setDescription(text)
     .setTimestamp();
 
-  msg.channel.send({ embeds: [embed] });
+  await msg.channel.send({ embeds: [embed] });
 });
 
 // ===== ADMIN RESET QUEUE COMMAND =====
@@ -700,31 +882,32 @@ client.on("messageCreate", async msg => {
   if (msg.content !== "!resetqueue") return;
 
   const isAdmin =
-    msg.member.roles.cache.some(r => r.name === "Admin") ||
+    msg.member.roles.cache.some(r => r.name === ADMIN_ROLE) ||
     msg.member.roles.cache.some(r => r.name === SCORE_ROLE);
 
   if (!isAdmin) {
-    return msg.reply("No tienes permiso para resetear la cola.");
+    return msg.reply("You do not have permission to reset the queue.");
   }
 
-  // SOLO resetear cola / draft / match activo
-  queue = [];
-  queueJoinTimes = {};
-  match = null;
+  for (const modeKey of Object.keys(queueState)) {
+    queueState[modeKey].queue = [];
+    queueState[modeKey].queueJoinTimes = {};
+  }
+
+  activeMatch = null;
+  isStartingMatch = false;
+  isScoringMatch = false;
   picksMessageId = null;
   resultsMessageId = null;
 
-  const queueChannel = msg.guild.channels.cache.find(c => c.name === CHANNELS.queue);
-  if (queueChannel) {
-    await updateQueueMessage(queueChannel);
-  }
+  await updateAllQueueMessages(msg.guild);
 
-  const portalChannel = msg.guild.channels.cache.find(c => c.name === CHANNELS.portal);
+  const portalChannel = getPortalChannel(msg.guild);
   if (portalChannel) {
-    await portalChannel.send("⚠️ La cola y el match/draft activo han sido reseteados por un admin.");
+    await portalChannel.send("⚠️ All queues and the active draft/match were reset by admin.");
   }
 
-  await msg.reply("Queue reseteada. Los puntajes no fueron modificados.");
+  await msg.reply("Queues reset complete. Scores were not changed.");
 });
 
 // ===== BUTTON HANDLER =====
@@ -735,235 +918,248 @@ client.on("interactionCreate", async interaction => {
     const userId = interaction.user.id;
 
     // ===== QUEUE BUTTONS =====
-if (interaction.customId === "join" || interaction.customId === "leave") {
-  await interaction.deferUpdate();
+    if (interaction.customId.startsWith("join_") || interaction.customId.startsWith("leave_")) {
+      await interaction.deferUpdate();
 
-  // Si está arrancando match o ya hay match activo, no dejar entrar
-  if (interaction.customId === "join") {
-    if (isQueueLocked() || isStartingMatch) {
-      try {
-        await interaction.followUp({
-          content: "La cola está bloqueada porque hay un match en curso o arrancando.",
-          ephemeral: true
-        });
-      } catch {}
+      const [action, modeKey] = interaction.customId.split("_");
+      const state = queueState[modeKey];
+
+      if (!state) return;
+
+      if (action === "join") {
+        if (isAnyMatchRunning() || isStartingMatch) {
+          try {
+            await interaction.followUp({
+              content: "All queues are locked while a match is running or starting.",
+              ephemeral: true
+            });
+          } catch {}
+          return;
+        }
+
+        const existingQueue = getPlayerQueuedMode(userId);
+        if (existingQueue && existingQueue !== modeKey) {
+          try {
+            await interaction.followUp({
+              content: `You are already in the ${MODES[existingQueue].label} queue.`,
+              ephemeral: true
+            });
+          } catch {}
+          return;
+        }
+
+        if (!state.queue.includes(userId)) {
+          state.queue.push(userId);
+          state.queueJoinTimes[userId] = Date.now();
+          await sendPortalUpdate(interaction.guild, modeKey, "join", userId);
+        }
+      }
+
+      if (action === "leave") {
+        if (state.queue.includes(userId)) {
+          state.queue = state.queue.filter(id => id !== userId);
+          delete state.queueJoinTimes[userId];
+          await sendPortalUpdate(interaction.guild, modeKey, "leave", userId);
+        }
+      }
+
+      await updateQueueMessage(modeKey, interaction.channel);
+
+      if (state.queue.length >= MODES[modeKey].size && !isStartingMatch && activeMatch === null) {
+        await startMatch(interaction.guild, modeKey);
+      }
+
       return;
     }
 
-    if (!queue.includes(userId)) {
-      queue.push(userId);
-      queueJoinTimes[userId] = Date.now();
-      await sendPortalUpdate(interaction.guild, "join", userId);
-    }
-  }
-
-  if (interaction.customId === "leave") {
-    if (queue.includes(userId)) {
-      queue = queue.filter(id => id !== userId);
-      delete queueJoinTimes[userId];
-      await sendPortalUpdate(interaction.guild, "leave", userId);
-    }
-  }
-
-  await updateQueueMessage(interaction.channel);
-
-  if (queue.length >= 10 && !isStartingMatch && match === null) {
-    await startMatch(interaction.guild);
-  }
-
-  return;
-}
-
     // ===== DRAFT PICK BUTTONS =====
     if (interaction.customId.startsWith("draft_pick_")) {
-  if (!match) {
-    return interaction.reply({ content: "No active draft.", ephemeral: true });
-  }
+      if (!activeMatch) {
+        return interaction.reply({ content: "No active draft.", ephemeral: true });
+      }
 
-  const playerId = interaction.customId.replace("draft_pick_", "");
-  const teamTurn = match.turnOrder[match.turnIndex];
-  const currentCaptain = teamTurn === 1 ? match.team1[0] : match.team2[0];
+      const playerId = interaction.customId.replace("draft_pick_", "");
+      const teamTurn = activeMatch.turnOrder[activeMatch.turnIndex];
+      const currentCaptain = teamTurn === 1 ? activeMatch.team1[0] : activeMatch.team2[0];
 
-  if (interaction.user.id !== currentCaptain) {
-    return interaction.reply({ content: "It is not your turn to pick.", ephemeral: true });
-  }
+      if (interaction.user.id !== currentCaptain) {
+        return interaction.reply({ content: "It is not your turn to pick.", ephemeral: true });
+      }
 
-  if (!match.available.includes(playerId)) {
-    return interaction.reply({ content: "That player is no longer available.", ephemeral: true });
-  }
+      if (!activeMatch.available.includes(playerId)) {
+        return interaction.reply({ content: "That player is no longer available.", ephemeral: true });
+      }
 
-  await interaction.deferUpdate();
+      await interaction.deferUpdate();
 
-  if (teamTurn === 1) {
-    match.team1.push(playerId);
-  } else {
-    match.team2.push(playerId);
-  }
+      if (teamTurn === 1) {
+        activeMatch.team1.push(playerId);
+      } else {
+        activeMatch.team2.push(playerId);
+      }
 
-  match.available = match.available.filter(id => id !== playerId);
-  match.turnIndex++;
+      activeMatch.available = activeMatch.available.filter(id => id !== playerId);
+      activeMatch.turnIndex++;
 
-  const picksChannel = interaction.guild.channels.cache.find(c => c.name === CHANNELS.picks);
+      const picksChannel = getPicksChannel(interaction.guild);
 
-  // Si queda 1 jugador, autoasignarlo y mostrar ambos últimos movimientos
-  if (match.available.length === 1) {
-    const lastPlayer = match.available[0];
+      if (activeMatch.available.length === 1) {
+        const lastPlayer = activeMatch.available[0];
 
-    let autoAssignedTeam = "";
-    if (match.team1.length < 5) {
-      match.team1.push(lastPlayer);
-      autoAssignedTeam = "Team 1";
-    } else {
-      match.team2.push(lastPlayer);
-      autoAssignedTeam = "Team 2";
+        let autoAssignedTeam = "";
+        if (activeMatch.team1.length < activeMatch.team2.length) {
+          activeMatch.team1.push(lastPlayer);
+          autoAssignedTeam = "Team 1";
+        } else {
+          activeMatch.team2.push(lastPlayer);
+          autoAssignedTeam = "Team 2";
+        }
+
+        activeMatch.available = [];
+
+        await updateDraftMessage(interaction.guild);
+
+        if (picksChannel) {
+          await picksChannel.send(
+            `✅ ${MODES[activeMatch.modeKey].label} Picked: <@${playerId}>\n` +
+            `📌 Auto-assigned final player: <@${lastPlayer}> → ${autoAssignedTeam}`
+          );
+        }
+
+        await finishMatch(interaction.guild);
+        return;
+      }
+
+      if (activeMatch.available.length === 0 || activeMatch.turnIndex >= activeMatch.turnOrder.length) {
+        await updateDraftMessage(interaction.guild);
+
+        if (picksChannel) {
+          await picksChannel.send(`✅ ${MODES[activeMatch.modeKey].label} Picked: <@${playerId}>`);
+        }
+
+        await finishMatch(interaction.guild);
+        return;
+      }
+
+      await updateDraftMessage(interaction.guild);
+
+      if (picksChannel) {
+        await picksChannel.send(`✅ ${MODES[activeMatch.modeKey].label} Picked: <@${playerId}>`);
+      }
+
+      return;
     }
-
-    match.available = [];
-
-    await updateDraftMessage(interaction.guild);
-
-    if (picksChannel) {
-      await picksChannel.send(
-        `✅ Picked: <@${playerId}>\n` +
-        `📌 Auto-assigned final player: <@${lastPlayer}> → ${autoAssignedTeam}`
-      );
-    }
-
-    await finishMatch(interaction.guild);
-    return;
-  }
-
-  if (match.available.length === 0 || match.turnIndex >= match.turnOrder.length) {
-    await updateDraftMessage(interaction.guild);
-
-    if (picksChannel) {
-      await picksChannel.send(`✅ Picked: <@${playerId}>`);
-    }
-
-    await finishMatch(interaction.guild);
-    return;
-  }
-
-  await updateDraftMessage(interaction.guild);
-
-  if (picksChannel) {
-    await picksChannel.send(`✅ Picked: <@${playerId}>`);
-  }
-
-  return;
-}
 
     // ===== SCORE BUTTONS =====
-if (interaction.customId === "score_team1" || interaction.customId === "score_team2") {
-  if (!match) {
-    return interaction.reply({ content: "No active match to score.", ephemeral: true });
-  }
-
-  if (isScoringMatch || match.scored) {
-    return interaction.reply({ content: "Este match ya fue scoreado o se está procesando.", ephemeral: true });
-  }
-
-  const member = interaction.member;
-  if (!member.roles.cache.some(r => r.name === SCORE_ROLE)) {
-    return interaction.reply({ content: "You do not have permission to score games.", ephemeral: true });
-  }
-
-  isScoringMatch = true;
-  match.scored = true;
-
-  try {
-    await interaction.deferUpdate();
-
-    const winner = interaction.customId === "score_team1" ? "team1" : "team2";
-
-    const win = winner === "team1" ? match.team1 : match.team2;
-    const lose = winner === "team1" ? match.team2 : match.team1;
-
-    const winData = {};
-    const loseData = {};
-
-    for (const id of win) {
-      ensurePlayerData(id);
-      winData[id] = updatePointsDetailed(id, true);
-      data[id].wins += 1;
-      data[id].games += 1;
-    }
-
-    for (const id of lose) {
-      ensurePlayerData(id);
-      loseData[id] = updatePointsDetailed(id, false);
-      data[id].losses += 1;
-      data[id].games += 1;
-    }
-
-    saveData();
-
-    for (const playerId of [...win, ...lose]) {
-      const guildMember = await interaction.guild.members.fetch(playerId).catch(() => null);
-      if (guildMember) {
-        await updateMemberRankRole(guildMember);
-        await updateMemberPointsNickname(guildMember);
+    if (interaction.customId === "score_team1" || interaction.customId === "score_team2") {
+      if (!activeMatch) {
+        return interaction.reply({ content: "No active match to score.", ephemeral: true });
       }
+
+      if (isScoringMatch || activeMatch.scored) {
+        return interaction.reply({ content: "This match is already being scored or has already been scored.", ephemeral: true });
+      }
+
+      const member = interaction.member;
+      if (!member.roles.cache.some(r => r.name === SCORE_ROLE)) {
+        return interaction.reply({ content: "You do not have permission to score games.", ephemeral: true });
+      }
+
+      isScoringMatch = true;
+      activeMatch.scored = true;
+
+      try {
+        await interaction.deferUpdate();
+
+        const winner = interaction.customId === "score_team1" ? "team1" : "team2";
+
+        const win = winner === "team1" ? activeMatch.team1 : activeMatch.team2;
+        const lose = winner === "team1" ? activeMatch.team2 : activeMatch.team1;
+
+        const winData = {};
+        const loseData = {};
+
+        for (const id of win) {
+          ensurePlayerData(id);
+          winData[id] = updatePointsDetailed(id, true);
+          data[id].wins += 1;
+          data[id].games += 1;
+        }
+
+        for (const id of lose) {
+          ensurePlayerData(id);
+          loseData[id] = updatePointsDetailed(id, false);
+          data[id].losses += 1;
+          data[id].games += 1;
+        }
+
+        saveData();
+
+        for (const playerId of [...win, ...lose]) {
+          const guildMember = await interaction.guild.members.fetch(playerId).catch(() => null);
+          if (guildMember) {
+            await updateMemberRankRole(guildMember);
+            await updateMemberPointsNickname(guildMember);
+          }
+        }
+
+        const matchId = peekNextMatchId();
+
+        const formatPlayers = (players, dataObj) =>
+          players.map(id => {
+            const p = dataObj[id];
+            const stats = data[id];
+            const winrate = stats.games > 0
+              ? ((stats.wins / stats.games) * 100).toFixed(0)
+              : 0;
+
+            return `<@${id}> ${p.before} → ${p.after} | ${stats.wins}W-${stats.losses}L (${winrate}%)`;
+          }).join("\n");
+
+        const embed = new EmbedBuilder()
+          .setTitle(`Game #${matchId} — ${MODES[activeMatch.modeKey].label}`)
+          .addFields(
+            {
+              name: "🏆 Winners",
+              value: formatPlayers(win, winData),
+              inline: true
+            },
+            {
+              name: "❌ Losers",
+              value: formatPlayers(lose, loseData),
+              inline: true
+            }
+          )
+          .setFooter({ text: `Winner: ${winner}` })
+          .setTimestamp();
+
+        const resultsChannel = getResultsChannel(interaction.guild);
+        if (!resultsChannel) {
+          throw new Error("Results channel not found");
+        }
+
+        await resultsChannel.send({ embeds: [embed] });
+
+        commitNextMatchId();
+        saveMatchHistory(matchId, activeMatch.modeKey, activeMatch.team1, activeMatch.team2, winner);
+
+        await disableResultButtons(interaction.guild);
+        await updateLeaderboard(interaction.guild);
+
+        activeMatch = null;
+        picksMessageId = null;
+        resultsMessageId = null;
+
+        await updateAllQueueMessages(interaction.guild);
+      } catch (err) {
+        console.error("Score processing error:", err);
+        if (activeMatch) activeMatch.scored = false;
+      } finally {
+        isScoringMatch = false;
+      }
+
+      return;
     }
-
-    const matchId = peekNextMatchId();
-
-const formatPlayers = (players, dataObj) =>
-  players.map(id => {
-    const p = dataObj[id];
-    const stats = data[id];
-    const winrate = stats.games > 0
-      ? ((stats.wins / stats.games) * 100).toFixed(0)
-      : 0;
-
-    return `<@${id}> ${p.before} → ${p.after} | ${stats.wins}W-${stats.losses}L (${winrate}%)`;
-  }).join("\n");
-
-const embed = new EmbedBuilder()
-  .setTitle(`Game #${matchId}`)
-  .addFields(
-    {
-      name: "🏆 Winners",
-      value: formatPlayers(win, winData),
-      inline: true
-    },
-    {
-      name: "❌ Losers",
-      value: formatPlayers(lose, loseData),
-      inline: true
-    }
-  )
-  .setFooter({ text: `Winner: ${winner}` })
-  .setTimestamp();
-
-const resultsChannel = interaction.guild.channels.cache.find(c => c.name === CHANNELS.results);
-if (resultsChannel) {
-  await resultsChannel.send({ embeds: [embed] });
-
-  commitNextMatchId();
-  saveMatchHistory(matchId, match.team1, match.team2, winner);
-}
-
-    await disableResultButtons(interaction.guild);
-    await updateLeaderboard(interaction.guild);
-
-    match = null;
-
-    const queueChannel = interaction.guild.channels.cache.find(c => c.name === CHANNELS.queue);
-    if (queueChannel) {
-      await updateQueueMessage(queueChannel);
-    }
-
-    } catch (err) {
-    console.error("Score processing error:", err);
-    match.scored = false;
-  } finally {
-    isScoringMatch = false;
-  }
-
-  return;
-}
-
   } catch (err) {
     console.error("Interaction error:", err);
 
@@ -975,105 +1171,18 @@ if (resultsChannel) {
   }
 });
 
-// ===== START MATCH =====
-async function startMatch(guild) {
-  if (isStartingMatch || match !== null) return;
-
-  isStartingMatch = true;
-
-  try {
-    if (queue.length < 10) return;
-
-    const players = [...queue].slice(0, 10);
-
-    // Quitar SOLO los 10 primeros del queue
-    queue = queue.filter(id => !players.includes(id));
-
-    // Limpiar sus timers
-    for (const id of players) {
-      delete queueJoinTimes[id];
-    }
-
-    const queueChannel = guild.channels.cache.find(c => c.name === CHANNELS.queue);
-    await updateQueueMessage(queueChannel);
-
-    const captainRole = guild.roles.cache.find(r => r.name === CAPTAIN_ROLE);
-
-    let captains = [];
-    if (captainRole) {
-      captains = players.filter(id =>
-        guild.members.cache.get(id)?.roles.cache.has(captainRole.id)
-      );
-    }
-
-    if (captains.length < 2) captains = [...players];
-
-    // Fisher-Yates
-    for (let i = captains.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [captains[i], captains[j]] = [captains[j], captains[i]];
-    }
-
-    captains = captains.slice(0, 2);
-
-    if (captains.length < 2) return;
-
-    match = {
-      team1: [captains[0]],
-      team2: [captains[1]],
-      available: players.filter(p => !captains.includes(p)),
-      turnOrder: [1, 2, 2, 1, 1, 2, 2],
-      turnIndex: 0,
-      scored: false
-    };
-
-    picksMessageId = null;
-    resultsMessageId = null;
-
-    await updateDraftMessage(guild);
-  } catch (err) {
-    console.error("startMatch error:", err);
-  } finally {
-    isStartingMatch = false;
-  }
-}
-
-// ===== FINISH MATCH =====
-async function finishMatch(guild) {
-  const results = guild.channels.cache.find(c => c.name === CHANNELS.results);
-  if (!results || !match) return;
-
-  const embed = buildResultsEmbed();
-  const components = buildResultButtons();
-
-  const msg = await results.send({
-    embeds: [embed],
-    components
-  });
-
-  resultsMessageId = msg.id;
-
-  const picksChannel = guild.channels.cache.find(c => c.name === CHANNELS.picks);
-  if (picksChannel && picksMessageId) {
-    try {
-      const picksMsg = await picksChannel.messages.fetch(picksMessageId);
-      await picksMsg.edit({ components: [] });
-    } catch {}
-  }
-}
-
+// ===== QUEUE TIMEOUT LOOP =====
 setInterval(async () => {
   const guild = client.guilds.cache.first();
   if (!guild) return;
 
-  if (queue.length > 0 && !isQueueLocked()) {
-    await removeExpiredQueuePlayers(guild);
-
-    const queueChannel = guild.channels.cache.find(c => c.name === CHANNELS.queue);
-    if (queueChannel) {
-      await updateQueueMessage(queueChannel);
+  for (const modeKey of Object.keys(MODES)) {
+    if (queueState[modeKey].queue.length > 0 && !isAnyMatchRunning()) {
+      await removeExpiredQueuePlayers(guild, modeKey);
     }
   }
+
+  await updateAllQueueMessages(guild);
 }, 30 * 1000);
 
 client.login(process.env.DISCORD_TOKEN);
