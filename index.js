@@ -50,6 +50,12 @@ const MODES = {
     queueChannel: "7s",
     size: 14,
     turnOrder: [1, 2, 2, 1, 1, 2, 2, 1, 1, 2, 2, 1]
+  },
+  "5s-rsb": {
+    label: "5v5 RSB",
+    queueChannel: "5s-rsb",
+    size: 10,
+    turnOrder: [1, 2, 2, 1, 1, 2, 2]
   }
 };
 
@@ -102,7 +108,8 @@ function saveData() {
 const queueState = {
   "3s": { queue: [], queueJoinTimes: {}, messageId: null },
   "5s": { queue: [], queueJoinTimes: {}, messageId: null },
-  "7s": { queue: [], queueJoinTimes: {}, messageId: null }
+  "7s": { queue: [], queueJoinTimes: {}, messageId: null },
+  "5s-rsb": { queue: [], queueJoinTimes: {}, messageId: null }
 };
 
 let activeMatch = null;
