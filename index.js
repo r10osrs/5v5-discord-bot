@@ -29,7 +29,8 @@ const CHANNELS = {
   portal: "portal",
   picks: "picks",
   results: "results",
-  leaderboard: "leaderboard"
+  leaderboard: "leaderboard",
+  battle: "battle-royale"
 };
 
 const MODES = {
@@ -112,6 +113,15 @@ const queueState = {
   "5s-rsb": { queue: [], queueJoinTimes: {}, messageId: null }
 };
 
+const battleState = {
+  unlocked: false,
+  queue: [],
+  queueJoinTimes: {},
+  messageId: null
+};
+
+let battleMatch = null;
+let battleDraftMessageId = null;
 let activeMatch = null;
 let isStartingMatch = false;
 let isScoringMatch = false;
@@ -151,6 +161,10 @@ function getPortalChannel(guild) {
 
 function getLeaderboardChannel(guild) {
   return guild.channels.cache.find(c => c.name === CHANNELS.leaderboard);
+}
+
+function getBattleChannel(guild) {
+  return guild.channels.cache.find(c => c.name === CHANNELS.battle);
 }
 
 async function updateAllQueueMessages(guild) {
@@ -390,6 +404,59 @@ async function updateQueueMessage(modeKey, channel) {
     state.messageId = newMessage.id;
   } catch (err) {
     console.error(`updateQueueMessage error (${modeKey}):`, err);
+  }
+}
+
+// ===== BATTLE ROYALE =====
+async function updateBattleMessage(guild) {
+  try {
+    const channel = getBattleChannel(guild);
+    if (!channel) return;
+
+    const queueLines = battleState.queue.length
+      ? battleState.queue.map((id, index) => `${index + 1}. <@${id}>`).join("\n")
+      : "No players registered yet";
+
+    const embed = new EmbedBuilder()
+      .setTitle("🔥 Battle Royale Event")
+      .setDescription(
+        `**Status:** ${battleState.unlocked ? "🟢 OPEN" : "🔴 CLOSED"}\n` +
+        `**Players:** ${battleState.queue.length}/40\n\n` +
+        `${queueLines}`
+      )
+      .setFooter({
+        text: battleState.unlocked
+          ? "Registrations are open"
+          : "Registrations are currently locked"
+      })
+      .setTimestamp();
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId("battle_join")
+        .setLabel("Join Battle Royale")
+        .setStyle(ButtonStyle.Success)
+        .setDisabled(!battleState.unlocked),
+      new ButtonBuilder()
+        .setCustomId("battle_leave")
+        .setLabel("Leave Battle Royale")
+        .setStyle(ButtonStyle.Danger)
+    );
+
+    if (battleState.messageId) {
+      try {
+        const msg = await channel.messages.fetch(battleState.messageId);
+        await msg.edit({ embeds: [embed], components: [row] });
+        return;
+      } catch {
+        battleState.messageId = null;
+      }
+    }
+
+    const newMsg = await channel.send({ embeds: [embed], components: [row] });
+    battleState.messageId = newMsg.id;
+  } catch (err) {
+    console.error("updateBattleMessage error:", err);
   }
 }
 
@@ -641,6 +708,52 @@ async function refreshPlayerAfterPointChange(guild, userId) {
   await updateMemberPointsNickname(member);
 }
 
+// ===== BATTLE ROYALE MATCH =====
+async function startBattleRoyale(guild) {
+  if (battleMatch) return;
+
+  const players = [...battleState.queue];
+
+  if (players.length < 40) return;
+
+  const captainRole = guild.roles.cache.find(r => r.name === CAPTAIN_ROLE);
+
+  let captains = [];
+  if (captainRole) {
+    captains = players.filter(id =>
+      guild.members.cache.get(id)?.roles.cache.has(captainRole.id)
+    );
+  }
+
+  if (captains.length < 8) {
+    const nonCaptains = players.filter(id => !captains.includes(id));
+    captains = [...captains, ...nonCaptains];
+  }
+
+  for (let i = captains.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [captains[i], captains[j]] = [captains[j], captains[i]];
+  }
+
+  captains = captains.slice(0, 8);
+
+  const teams = captains.map(captainId => [captainId]);
+  const available = players.filter(id => !captains.includes(id));
+
+  battleMatch = {
+    teams,
+    available,
+    turnOrder: [0,1,2,3,4,5,6,7,7,6,5,4,3,2,1,0,0,1,2,3,4,5,6,7,7,6,5,4,3,2,1,0],
+    turnIndex: 0,
+    scored: false
+  };
+
+  battleState.unlocked = false;
+
+  await updateBattleMessage(guild);
+  await updateBattleDraftMessage(guild);
+}
+
 // ===== MATCH =====
 async function startMatch(guild, modeKey) {
   if (isStartingMatch || activeMatch !== null) return;
@@ -743,10 +856,92 @@ client.once("clientReady", async () => {
 
   await updateLeaderboard(guild);
 
-  const autoAdminMember = await guild.members.fetch(AUTO_ADMIN_USER_ID).catch(() => null);
-  if (autoAdminMember) {
-    await ensureAutoAdmin(autoAdminMember);
+await updateBattleMessage(guild);
+
+const autoAdminMember = await guild.members.fetch(AUTO_ADMIN_USER_ID).catch(() => null);
+if (autoAdminMember) {
+  await ensureAutoAdmin(autoAdminMember);
+}
+
+// ===== Battledraft =====
+function buildBattleDraftEmbed() {
+  if (!battleMatch) return null;
+
+  const currentTeamIndex = battleMatch.turnOrder[battleMatch.turnIndex];
+  const currentCaptain = battleMatch.teams[currentTeamIndex][0];
+
+  let teamsText = "";
+
+  for (let i = 0; i < battleMatch.teams.length; i++) {
+    teamsText += `**Team ${i + 1}:**\n`;
+    teamsText += battleMatch.teams[i].map(id => `<@${id}>`).join("\n");
+    teamsText += "\n\n";
   }
+
+  const availableText = battleMatch.available.length
+    ? battleMatch.available.map(id => `<@${id}>`).join("\n")
+    : "No players remaining";
+
+  return new EmbedBuilder()
+    .setTitle("🔥 Battle Royale Draft")
+    .setDescription(
+      `**Current turn:** <@${currentCaptain}> — Team ${currentTeamIndex + 1}\n\n` +
+      `${teamsText}` +
+      `**Available Players:**\n${availableText}`
+    )
+    .setTimestamp();
+}
+
+function buildBattleDraftButtons(guild) {
+  if (!battleMatch) return [];
+
+  const rows = [];
+  const chunkSize = 5;
+
+  for (let i = 0; i < battleMatch.available.length; i += chunkSize) {
+    const row = new ActionRowBuilder();
+    const slice = battleMatch.available.slice(i, i + chunkSize);
+
+    for (const playerId of slice) {
+      const member = guild.members.cache.get(playerId);
+      const name = member?.displayName || member?.user?.username || "Player";
+      ensurePlayerData(playerId);
+      const points = data[playerId].points;
+
+      row.addComponents(
+        new ButtonBuilder()
+          .setCustomId(`battle_pick_${playerId}`)
+          .setLabel(`${points} ${name}`.slice(0, 20))
+          .setStyle(ButtonStyle.Primary)
+      );
+    }
+
+    rows.push(row);
+  }
+
+  return rows;
+}
+
+async function updateBattleDraftMessage(guild) {
+  const picksChannel = getPicksChannel(guild);
+  if (!picksChannel || !battleMatch) return;
+
+  const embed = buildBattleDraftEmbed();
+  const components = buildBattleDraftButtons(guild);
+
+  if (battleDraftMessageId) {
+    try {
+      const msg = await picksChannel.messages.fetch(battleDraftMessageId);
+      await msg.edit({ embeds: [embed], components });
+      return;
+    } catch {
+      battleDraftMessageId = null;
+    }
+  }
+
+  const newMsg = await picksChannel.send({ embeds: [embed], components });
+  battleDraftMessageId = newMsg.id;
+}
 });
 
 // ===== MEMBER ROLE -> START RANK SYSTEM =====
@@ -883,6 +1078,97 @@ client.on("messageCreate", async msg => {
   await msg.channel.send({ embeds: [embed] });
 });
 
+// ===== BATTLE ROYALE LOCK / UNLOCK COMMANDS =====
+client.on("messageCreate", async msg => {
+  if (msg.author.bot) return;
+
+  const command = msg.content.trim().toLowerCase();
+
+  if (command !== "!unlockbattle" && command !== "!lockbattle") return;
+
+  const hasPermission =
+    msg.member.roles.cache.some(r => r.name === ADMIN_ROLE) ||
+    msg.member.roles.cache.some(r => r.name === SCORE_ROLE);
+
+  if (!hasPermission) {
+    return msg.reply("You do not have permission to manage Battle Royale.");
+  }
+
+  if (command === "!unlockbattle") {
+    battleState.unlocked = true;
+    await updateBattleMessage(msg.guild);
+
+    const portalChannel = getPortalChannel(msg.guild);
+    if (portalChannel) {
+      await portalChannel.send(`🔓 Battle Royale registrations opened by <@${msg.author.id}>.`);
+    }
+
+    return msg.reply("Battle Royale queue is now open.");
+  }
+
+  if (command === "!lockbattle") {
+    battleState.unlocked = false;
+    await updateBattleMessage(msg.guild);
+
+    const portalChannel = getPortalChannel(msg.guild);
+    if (portalChannel) {
+      await portalChannel.send(`🔒 Battle Royale registrations closed by <@${msg.author.id}>.`);
+    }
+
+    return msg.reply("Battle Royale queue is now closed.");
+  }
+});
+
+// ===== RESET SEASON COMMAND =====
+client.on("messageCreate", async msg => {
+  if (msg.author.bot) return;
+  if (msg.content.trim().toLowerCase() !== "!resetseason") return;
+
+  const isAdmin = msg.member.roles.cache.some(r => r.name === ADMIN_ROLE);
+
+  if (!isAdmin) {
+    return msg.reply("You do not have permission to reset the season.");
+  }
+
+  for (const userId of Object.keys(data)) {
+    if (userId.startsWith("_")) continue;
+
+    if (data[userId] && typeof data[userId] === "object") {
+      data[userId].points = 180;
+      data[userId].wins = 0;
+      data[userId].losses = 0;
+      data[userId].games = 0;
+    }
+  }
+
+  data._matches = [];
+  if (data._meta) {
+    data._meta.nextMatchId = 1;
+  }
+
+  saveData();
+
+  const members = await msg.guild.members.fetch();
+
+  for (const member of members.values()) {
+    if (data[member.id]) {
+      await updateMemberRankRole(member);
+      await updateMemberPointsNickname(member);
+    }
+  }
+
+  await updateLeaderboard(msg.guild);
+
+  const portalChannel = getPortalChannel(msg.guild);
+  if (portalChannel) {
+    await portalChannel.send(
+      "🏆 **New Season Started!**\nAll player scores have been reset to **180 points (Bronze)**."
+    );
+  }
+
+  await msg.reply("Season reset complete. All players are back to 180 points.");
+});
+
 // ===== ADMIN RESET QUEUE COMMAND =====
 client.on("messageCreate", async msg => {
   if (msg.author.bot) return;
@@ -907,7 +1193,12 @@ client.on("messageCreate", async msg => {
   picksMessageId = null;
   resultsMessageId = null;
 
+  battleState.unlocked = false;
+  battleState.queue = [];
+  battleState.queueJoinTimes = {};
+
   await updateAllQueueMessages(msg.guild);
+  await updateBattleMessage(msg.guild);
 
   const portalChannel = getPortalChannel(msg.guild);
   if (portalChannel) {
@@ -923,6 +1214,269 @@ client.on("interactionCreate", async interaction => {
 
   try {
     const userId = interaction.user.id;
+
+// ===== BATTLE ROYALE BUTTONS =====
+if (interaction.customId === "battle_join" || interaction.customId === "battle_leave") {
+  await interaction.deferUpdate();
+
+  if (interaction.customId === "battle_join") {
+    if (!battleState.unlocked) {
+      try {
+        await interaction.followUp({
+          content: "Battle Royale registrations are currently locked.",
+          ephemeral: true
+        });
+      } catch {}
+      return;
+    }
+
+    if (battleState.queue.includes(userId)) {
+      try {
+        await interaction.followUp({
+          content: "You are already registered for Battle Royale.",
+          ephemeral: true
+        });
+      } catch {}
+      return;
+    }
+
+    if (battleState.queue.length >= 40) {
+      try {
+        await interaction.followUp({
+          content: "Battle Royale queue is already full.",
+          ephemeral: true
+        });
+      } catch {}
+      return;
+    }
+
+    battleState.queue.push(userId);
+    battleState.queueJoinTimes[userId] = Date.now();
+
+    const portalChannel = getPortalChannel(interaction.guild);
+    if (portalChannel) {
+      await portalChannel.send(
+        `🔥 <@${userId}> joined Battle Royale — ${battleState.queue.length}/40`
+      );
+    }
+
+    await updateBattleMessage(interaction.guild);
+
+    if (battleState.queue.length === 40) {
+  battleState.unlocked = false;
+
+  const resultsChannel = getResultsChannel(interaction.guild);
+  if (resultsChannel) {
+    await resultsChannel.send(
+      "🔥 **BATTLE ROYALE QUEUE FULL — 40/40**\nSelecting 8 captains and preparing the draft..."
+    );
+  }
+
+  await startBattleRoyale(interaction.guild);
+}
+
+    return;
+  }
+
+  if (interaction.customId === "battle_leave") {
+    if (battleState.queue.includes(userId)) {
+      battleState.queue = battleState.queue.filter(id => id !== userId);
+      delete battleState.queueJoinTimes[userId];
+
+      const portalChannel = getPortalChannel(interaction.guild);
+      if (portalChannel) {
+        await portalChannel.send(
+          `🔴 <@${userId}> left Battle Royale — ${battleState.queue.length}/40`
+        );
+      }
+
+      await updateBattleMessage(interaction.guild);
+    }
+
+    return;
+  }
+}
+
+// ===== BATTLE ROYALE SCORE BUTTONS =====
+if (interaction.customId.startsWith("battle_score_team_")) {
+  if (!battleMatch) {
+    return interaction.reply({
+      content: "No active Battle Royale match to score.",
+      ephemeral: true
+    });
+  }
+
+  if (isScoringMatch || battleMatch.scored) {
+    return interaction.reply({
+      content: "This Battle Royale has already been scored or is being processed.",
+      ephemeral: true
+    });
+  }
+
+  const member = interaction.member;
+  if (!member.roles.cache.some(r => r.name === SCORE_ROLE)) {
+    return interaction.reply({
+      content: "You do not have permission to score Battle Royale.",
+      ephemeral: true
+    });
+  }
+
+  const winnerIndex = Number(interaction.customId.replace("battle_score_team_", ""));
+
+  if (!Number.isInteger(winnerIndex) || winnerIndex < 0 || winnerIndex > 7) {
+    return interaction.reply({
+      content: "Invalid Battle Royale winner.",
+      ephemeral: true
+    });
+  }
+
+  isScoringMatch = true;
+  battleMatch.scored = true;
+
+  try {
+    await interaction.deferUpdate();
+
+    const win = battleMatch.teams[winnerIndex];
+    const lose = battleMatch.teams
+      .filter((_, index) => index !== winnerIndex)
+      .flat();
+
+    const winData = {};
+    const loseData = {};
+
+    for (const id of win) {
+      ensurePlayerData(id);
+      winData[id] = updatePointsDetailed(id, true);
+      data[id].wins += 1;
+      data[id].games += 1;
+    }
+
+    for (const id of lose) {
+      ensurePlayerData(id);
+      loseData[id] = updatePointsDetailed(id, false);
+      data[id].losses += 1;
+      data[id].games += 1;
+    }
+
+    saveData();
+
+    for (const playerId of [...win, ...lose]) {
+      const guildMember = await interaction.guild.members.fetch(playerId).catch(() => null);
+      if (guildMember) {
+        await updateMemberRankRole(guildMember);
+        await updateMemberPointsNickname(guildMember);
+      }
+    }
+
+    const matchId = peekNextMatchId();
+
+    const formatPlayers = (players, dataObj) =>
+      players.map(id => {
+        const p = dataObj[id];
+        const stats = data[id];
+        const winrate = stats.games > 0
+          ? ((stats.wins / stats.games) * 100).toFixed(0)
+          : 0;
+
+        return `<@${id}> ${p.before} → ${p.after} | ${stats.wins}W-${stats.losses}L (${winrate}%)`;
+      }).join("\n");
+
+    const embed = new EmbedBuilder()
+      .setTitle(`Game #${matchId} — Battle Royale`)
+      .addFields(
+        {
+          name: `🏆 Winners — Team ${winnerIndex + 1}`,
+          value: formatPlayers(win, winData),
+          inline: false
+        },
+        {
+          name: "❌ Losers",
+          value: formatPlayers(lose, loseData).slice(0, 1024),
+          inline: false
+        }
+      )
+      .setFooter({ text: `Winner: Team ${winnerIndex + 1}` })
+      .setTimestamp();
+
+    const resultsChannel = getResultsChannel(interaction.guild);
+    if (!resultsChannel) {
+      throw new Error("Results channel not found");
+    }
+
+    await resultsChannel.send({ embeds: [embed] });
+
+    commitNextMatchId();
+
+    if (!data._matches) {
+      data._matches = [];
+    }
+
+    data._matches.push({
+      id: matchId,
+      mode: "Battle Royale",
+      teams: battleMatch.teams,
+      winner: `Team ${winnerIndex + 1}`,
+      timestamp: Date.now()
+    });
+
+    saveData();
+
+    await disableResultButtons(interaction.guild);
+    await updateLeaderboard(interaction.guild);
+
+    battleMatch = null;
+    battleDraftMessageId = null;
+    resultsMessageId = null;
+
+    await updateAllQueueMessages(interaction.guild);
+    await updateBattleMessage(interaction.guild);
+  } catch (err) {
+    console.error("Battle Royale score processing error:", err);
+    if (battleMatch) battleMatch.scored = false;
+  } finally {
+    isScoringMatch = false;
+  }
+
+  return;
+}
+
+// ===== BATTLE ROYALE DRAFT PICKS =====
+if (interaction.customId.startsWith("battle_pick_")) {
+  if (!battleMatch) {
+    return interaction.reply({ content: "No active Battle Royale draft.", ephemeral: true });
+  }
+
+  const playerId = interaction.customId.replace("battle_pick_", "");
+  const teamIndex = battleMatch.turnOrder[battleMatch.turnIndex];
+  const currentCaptain = battleMatch.teams[teamIndex][0];
+
+  if (interaction.user.id !== currentCaptain) {
+    return interaction.reply({ content: "It is not your turn to pick.", ephemeral: true });
+  }
+
+  if (!battleMatch.available.includes(playerId)) {
+    return interaction.reply({ content: "That player is no longer available.", ephemeral: true });
+  }
+
+  await interaction.deferUpdate();
+
+  battleMatch.teams[teamIndex].push(playerId);
+  battleMatch.available = battleMatch.available.filter(id => id !== playerId);
+  battleMatch.turnIndex++;
+
+  const picksChannel = getPicksChannel(interaction.guild);
+  if (picksChannel) {
+    await picksChannel.send(`✅ Battle Royale Team ${teamIndex + 1} picked <@${playerId}>`);
+  }
+
+  if (battleMatch.available.length === 0 || battleMatch.turnIndex >= battleMatch.turnOrder.length) {
+    await finishBattleRoyaleDraft(interaction.guild);
+    return;
+  }
+
+  await updateBattleDraftMessage(interaction.guild);
+  return;
+}
 
     // ===== QUEUE BUTTONS =====
     if (interaction.customId.startsWith("join_") || interaction.customId.startsWith("leave_")) {
@@ -1056,6 +1610,52 @@ client.on("interactionCreate", async interaction => {
 
       return;
     }
+
+// ===== FINISH BATTLE ROYALE MATCH =====
+async function finishBattleRoyaleDraft(guild) {
+  const results = getResultsChannel(guild);
+  if (!results || !battleMatch) return;
+
+  const embed = new EmbedBuilder()
+    .setTitle("🔥 Battle Royale Teams Ready")
+    .setDescription(
+      battleMatch.teams.map((team, index) => {
+        return `**Team ${index + 1}:**\n${team.map(id => `<@${id}>`).join("\n")}`;
+      }).join("\n\n")
+    )
+    .setTimestamp();
+
+  const rows = [];
+  for (let i = 0; i < 8; i += 4) {
+    const row = new ActionRowBuilder();
+
+    for (let j = i; j < i + 4; j++) {
+      row.addComponents(
+        new ButtonBuilder()
+          .setCustomId(`battle_score_team_${j}`)
+          .setLabel(`Team ${j + 1} Wins`)
+          .setStyle(ButtonStyle.Success)
+      );
+    }
+
+    rows.push(row);
+  }
+
+  const msg = await results.send({
+    embeds: [embed],
+    components: rows
+  });
+
+  resultsMessageId = msg.id;
+
+  const picksChannel = getPicksChannel(guild);
+  if (picksChannel && battleDraftMessageId) {
+    try {
+      const draftMsg = await picksChannel.messages.fetch(battleDraftMessageId);
+      await draftMsg.edit({ components: [] });
+    } catch {}
+  }
+}
 
     // ===== SCORE BUTTONS =====
     if (interaction.customId === "score_team1" || interaction.customId === "score_team2") {
