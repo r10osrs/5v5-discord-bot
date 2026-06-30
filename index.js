@@ -683,7 +683,7 @@ function commitNextMatchId() {
   return id;
 }
 
-function saveMatchHistory(matchId, modeKey, team1, team2, winner) {
+function saveMatchHistory(matchId, modeKey, team1, team2, winner, scoredBy) {
   if (!data._matches) {
     data._matches = [];
   }
@@ -694,6 +694,7 @@ function saveMatchHistory(matchId, modeKey, team1, team2, winner) {
     team1,
     team2,
     winner,
+    scoredBy,
     timestamp: Date.now()
   });
 
@@ -1067,8 +1068,12 @@ client.on("messageCreate", async msg => {
   const lastMatches = data._matches.slice(-5).reverse();
 
   const text = lastMatches.map(m => {
-    return `Game #${m.id} — ${MODES[m.mode]?.label || m.mode} — Winner: ${m.winner}`;
-  }).join("\n");
+  return (
+    `Game #${m.id} — ${MODES[m.mode]?.label || m.mode}\n` +
+    `Winner: ${m.winner}\n` +
+    `Scored By: ${m.scoredBy ? `<@${m.scoredBy}>` : "Unknown"}`
+  );
+}).join("\n\n");
 
   const embed = new EmbedBuilder()
     .setTitle("Recent Matches")
@@ -1748,7 +1753,14 @@ async function finishBattleRoyaleDraft(guild) {
         await resultsChannel.send({ embeds: [embed] });
 
         commitNextMatchId();
-        saveMatchHistory(matchId, activeMatch.modeKey, activeMatch.team1, activeMatch.team2, winner);
+        saveMatchHistory(
+  matchId,
+  activeMatch.modeKey,
+  activeMatch.team1,
+  activeMatch.team2,
+  winner,
+  interaction.user.id
+);
 
         await disableResultButtons(interaction.guild);
         await updateLeaderboard(interaction.guild);
