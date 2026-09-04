@@ -52,12 +52,13 @@ const MODES = {
     size: 14,
     turnOrder: [1, 2, 2, 1, 1, 2, 2, 1, 1, 2, 2, 1]
   },
-  "5s-rsb": {
-    label: "5v5 RSB",
-    queueChannel: "5s-rsb",
-    size: 10,
-    turnOrder: [1, 2, 2, 1, 1, 2, 2]
-  }
+  "ofa-5s": {
+  label: "OFA 5v5",
+  queueChannel: "ofa-5s",
+  size: 10,
+  turnOrder: [1, 2, 2, 1, 1, 2, 2],
+  requiredRole: "ofa"
+}
 };
 
 const CAPTAIN_ROLE = "Captain";
@@ -110,7 +111,7 @@ const queueState = {
   "3s": { queue: [], queueJoinTimes: {}, messageId: null },
   "5s": { queue: [], queueJoinTimes: {}, messageId: null },
   "7s": { queue: [], queueJoinTimes: {}, messageId: null },
-  "5s-rsb": { queue: [], queueJoinTimes: {}, messageId: null }
+  "ofa-5s": { queue: [], queueJoinTimes: {}, messageId: null }
 };
 
 const battleState = {
@@ -1502,6 +1503,26 @@ if (interaction.customId.startsWith("battle_pick_")) {
           } catch {}
           return;
         }
+
+// ===== REQUIRED ROLE CHECK =====
+const requiredRole = MODES[modeKey]?.requiredRole;
+
+if (requiredRole) {
+  const hasRequiredRole = interaction.member.roles.cache.some(
+    role => role.name.toLowerCase() === requiredRole.toLowerCase()
+  );
+
+  if (!hasRequiredRole) {
+    try {
+      await interaction.followUp({
+        content: `You need the **${requiredRole}** role to join the ${MODES[modeKey].label} queue.`,
+        ephemeral: true
+      });
+    } catch {}
+
+    return;
+  }
+}
 
         const existingQueue = getPlayerQueuedMode(userId);
         if (existingQueue && existingQueue !== modeKey) {
